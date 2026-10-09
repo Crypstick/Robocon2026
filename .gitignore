@@ -7,6 +7,8 @@ env/
 envs/
 venv/
 .venv/
+Scripts/
+pyvenv.cfg
 
 # Conda build artifacts and packages
 conda-bld/
