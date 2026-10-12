@@ -3,7 +3,6 @@ import serial
 import json
 import time
 import threading
-import math
 
 try:
     import tkinter as tk
