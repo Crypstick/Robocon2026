@@ -5,8 +5,8 @@
 #include <ArduinoJson.h>
 #include <ArduinoJson.hpp>
 
-#include "CytronMotorDriver.h"
-#include "ODriveUART.h"
+#include "driver/twai.h"
+#include "ODriveESP32TWAI.hpp"
 
 #include <math.h>
 
@@ -20,32 +20,77 @@ void processController(String receivedInput);
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
 void OnDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len);
 
-void driveTrain_setSpeed(int topLeftSpeed, int topRightSpeed, int bottomLeftSpeed, int bottomRightSpeed);
+void driveTrain_setSpeed();
 void stopAll();
+
+bool setupCan();
+
+void onHeartbeat(Heartbeat_msg_t& msg, void* user_data);
+void onFeedback(Get_Encoder_Estimates_msg_t& msg, void* user_data);
+void onCanMessage(const CanMsg& msg);
+
+bool receiveHeartbeats();
+bool putClosedLoops();
+
+bool findLastCommands();
+void rearmDrives();
 
 // --- variable declarations --- //
 
 String incomingMessage;
 unsigned long lastMessageTime = 0; // millis() when the last controller message arrived
 
-//
 float TRVel = 0; float TLVel = 0; float BRVel = 0; float BLVel = 0;
 int KP = 0; int KI = 0; int KD = 0;
 float transVel = 0; float transAngle = 0; float cmdRot = 0;
 
+float COMMAND_PERIOD_MS = 20;           // run the rest of loop() at most 50 Hz (the PC sends at 50 Hz)
+float REARM_PERIOD_MS   = 500;          // retry a faulted drive at most twice a second
+float lastCommandTime = 0;            
+float lastRearmTime   = 0;              
+
 esp_now_peer_info_t peerInfo;
-uint8_t masterAddress[] = {0x78, 0x1C, 0x3C, 0xF6, 0x75, 0x24}; // the mac of the one sending to
+uint8_t masterAddress[] = {0x78, 0x1C, 0x3C, 0xF5, 0x09, 0x20}; // the mac of the one sending to
+
 
 // same as on transmitter
 static const char* PMK_KEY_STR = "XABqkVajNdMXUG8t";
 static const char* LMK_KEY_STR = "JUO+D7GGRsJDhi1V";
 
-// Odrive declarations
-HardwareSerial& odrive_serial = Serial2;
-ODriveUART odrive(odrive_serial);
+// --- Odrive declarations --- //
+
+#define CAN_BAUDRATE  250000   // CAN bus baudrate. Make sure this matches for every device on the bus
+
+#define TRodrv1_NODE_ID 1  // ODrive node_id for TRodrv1
+#define TLodrv2_NODE_ID 2
+#define BLodrv3_NODE_ID 3
+#define BRodrv4_NODE_ID 4 // watchdog enabled 16/10/26
+
+// Pins used to connect to CAN bus transceiver. the CRX is to the RX pin, CTX to the TX pin
+#define ESP32_TWAI_TX_PIN 26
+#define ESP32_TWAI_RX_PIN 25
+
+struct ODriveUserData {
+  Heartbeat_msg_t last_heartbeat;
+  bool received_heartbeat = false;
+  Get_Encoder_Estimates_msg_t last_feedback;
+  bool received_feedback = false;
+  unsigned long last_heartbeat_ms = 0; // millis() when the last heartbeat arrived, used to detect CAN loss
+};
+
+ESP32TWAIIntf can_intf;
+
+ODriveCAN TRodrv1(wrap_can_intf(can_intf), TRodrv1_NODE_ID); 
+ODriveCAN TLodrv2(wrap_can_intf(can_intf), TLodrv2_NODE_ID); 
+ODriveCAN BLodrv3(wrap_can_intf(can_intf), BLodrv3_NODE_ID);
+ODriveCAN BRodrv4(wrap_can_intf(can_intf), BRodrv4_NODE_ID);
+
+ODriveCAN* odrives[] = {&TRodrv1, &TLodrv2, &BLodrv3, &BRodrv4}; // Make sure all ODriveCAN instances are accounted for here
+
+ODriveUserData odrv_user_data[4]; // index thru for 1 to 4
+
 
 void setup() {
-    odrive_serial.begin(115200, SERIAL_8N1, 16, 17); // RX=16, TX=17
     Serial.begin(115200);
     WiFi.mode(WIFI_STA);
 
@@ -55,6 +100,7 @@ void setup() {
     Serial.print("mac address: ");
     Serial.println(WiFi.macAddress());
 
+    // --- ESPNOW Setup --- //
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
         return;
@@ -90,79 +136,148 @@ void setup() {
 
     Serial.println("ESP-NOW Receiver Ready");
 
-    // setting up odrive //
-    Serial.println("Waiting for ODrive...");
-    while (odrive.getState() == AXIS_STATE_UNDEFINED) {
-        delay(100);
-    }
-    Serial.println("found ODrive");
-    Serial.print("DC voltage: ");
-    Serial.println(odrive.getParameterAsFloat("vbus_voltage"));
-
-    // make sure the ODrive is in velocity mode with a ramp (defaults to position mode)
-    Serial.print("control_mode: ");
-    Serial.println(odrive.getParameterAsInt("axis0.controller.config.control_mode"));
-    Serial.print("input_mode: ");
-    Serial.println(odrive.getParameterAsInt("axis0.controller.config.input_mode"));
-    Serial.print("vel_limit: ");
-    Serial.println(odrive.getParameterAsFloat("axis0.controller.config.vel_limit"));
-    Serial.println("Enabling closed loop control..."); // basically use realtime feedback to manage stuff
-    while (odrive.getState() != AXIS_STATE_CLOSED_LOOP_CONTROL) {
-        odrive.clearErrors();
-        odrive.setState(AXIS_STATE_CLOSED_LOOP_CONTROL);
-        delay(10);
-    }
     
-    Serial.println("ODrive running!");
+
+    // setting up odrive //
+    
+    // Register callbacks for the heartbeat and encoder feedback messages
+    for (int i = 0; i < 4; i++) {
+        odrives[i]->onFeedback(onFeedback, &odrv_user_data[i]);
+        odrives[i]->onStatus(onHeartbeat, &odrv_user_data[i]);
+    }
+
+    // Configure and initialize the CAN bus interface. 
+    if (!setupCan()) {
+        Serial.println("CAN failed to initialize: reset required");
+        while (true); // spin indefinitely
+    } else {
+        Serial.println("success");
+    };
+
+    Serial.println("Waiting for ODrives...");
+    float lastPrint = 0;
+    while (!receiveHeartbeats()) {
+        pumpEvents(can_intf); // keep pumping continuously so the rx queue never overflows
+
+        if (millis() - lastPrint > 500) {
+            lastPrint = millis();
+            twai_status_info_t s;
+            twai_get_status_info(&s);
+            Serial.printf("missed=%lu overrun=%lu tx_err=%lu rx_err=%lu bus_err=%lu\n",
+                        s.rx_missed_count, s.rx_overrun_count, s.tx_error_counter, s.rx_error_counter, s.bus_error_count);
+        }
+    }
+
+    Serial.println("found ODrives");
+
+    // request bus voltage and current (1sec timeout)
+    Serial.println("attempting to read bus voltage and current");
+    Get_Bus_Voltage_Current_msg_t vbus;
+    bool vbusFound = false;
+    
+    while (!vbusFound) {
+        if (!TLodrv2.request(vbus, 1000)) {
+            Serial.println("vbus request failed!");
+            // spin indefinitely
+            vbusFound = false;
+        }
+        else { 
+            vbusFound = true;
+        }
+    }
+
+    Serial.print("DC voltage [V]: ");
+    Serial.println(vbus.Bus_Voltage);
+    Serial.print("DC current [A]: ");
+    Serial.println(vbus.Bus_Current);
+
+    Serial.println("Enabling closed loop control...");
+    while (!putClosedLoops()) {
+
+        for (int i = 0; i < 4; i++) {
+            if (odrv_user_data[i].last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
+                odrives[i]->clearErrors();
+                delay(1);
+                odrives[i]->setState(ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL);
+            }
+        }
+        // Pump events for 150ms. This delay is needed for two reasons;
+        // 1. If there is an error condition, such as missing DC power, the ODrive might
+        //    briefly attempt to enter CLOSED_LOOP_CONTROL state, so we can't rely
+        //    on the first heartbeat response, so we want to receive at least two
+        //    heartbeats (100ms default interval).
+        // 2. If the bus is congested, the setState command won't get through
+        //    immediately but can be delayed.
+        for (int i = 0; i < 15; ++i) {
+            delay(10);
+            pumpEvents(can_intf);
+        }
+    }
+
+    Serial.println("ODrives running!");
 }
 
 void loop() {
-    // all ODrive talking and sending happens here, so the receive callback stays fast
-
-    // if the ODrive disarmed (e.g. current limit), print why and re-enable it
-    if (odrive.getState() != AXIS_STATE_CLOSED_LOOP_CONTROL) {
-        Serial.print("ODrive disarmed, reason: 0x");
-        Serial.println(odrive.getParameterAsInt("axis0.disarm_reason"), HEX);
-        odrive.clearErrors();
-        odrive.setState(AXIS_STATE_CLOSED_LOOP_CONTROL);
+    pumpEvents(can_intf); // This is required on some platforms to handle incoming feedback CAN messages. This has been found to reduce the number of dropped messages, however it can be removed for applications requiring loop times over 100Hz.
+    if (!findLastCommands()) {
+         return; 
+    }
+        
+    bool controllerLost = (millis() - lastMessageTime > 1000);
+    bool canLost = false;                                      // CAN from any ODrive
+    for (int i = 0; i < 4; i++) {
+        if (millis() - odrv_user_data[i].last_heartbeat_ms > 1000) {
+            canLost = true;
+        }
     }
 
-    if (millis() - lastMessageTime > 500) { // controller lost -> stop
+    if (controllerLost || canLost) {
         transVel = 0;
         cmdRot = 0;
     }
-    // driveTrain_setSpeed(leftPower, rightPower, leftPower, rightPower);
-    TLVel = transVel * sin(transAngle);
 
-    odrive.setVelocity(TLVel);
+    driveTrain_setSpeed();
 
-    // send the current speed to the master
-    ODriveFeedback feedback = odrive.getFeedback();
-    String outgoingMessage = "{\"speed\":" + String(feedback.vel, 4) + "}";
-    esp_err_t result = esp_now_send(masterAddress, (uint8_t*)outgoingMessage.c_str(), outgoingMessage.length() + 1);
-    if (result != ESP_OK) {
-        Serial.print("Send error: ");
-        Serial.println(esp_err_to_name(result));
+    if (canLost) {
+        // the TWAI controller stays bus-off or stopped until restarted, so try to bring it back
+        twai_status_info_t s;
+        twai_get_status_info(&s);
+        if (s.state == TWAI_STATE_BUS_OFF) {
+            twai_initiate_recovery();
+        } else if (s.state == TWAI_STATE_STOPPED) {
+            twai_start();
+        }
     }
 
-    // debug: commanded vs measured speed
-    
-    Serial.print("cmd vel: ");
-    Serial.print(TLVel);
-    Serial.print("  measured vel: ");
-    Serial.print(feedback.vel);
-    // TEMP debug: what the ODrive thinks it is doing
-    Serial.print("  input_vel: ");      // the command the ODrive received
-    Serial.print(odrive.getParameterAsFloat("axis0.controller.input_vel"));
-    Serial.print("  vel_setpoint: ");   // the ramped target it is currently aiming for
-    Serial.println(odrive.getParameterAsFloat("axis0.controller.vel_setpoint"));
-    delay(20); // sends speed to the master (50 ms = 20 Hz)
+    rearmDrives();
+
+    // telemetry: one combined message at 20 Hz, not one packet per CAN feedback frame
+    // (per-frame sending overflowed ESP-NOW's buffer: ESP_ERR_ESPNOW_NO_MEM)
+    unsigned long lastTelemetry = 0;
+    if (millis() - lastTelemetry >= 50) {
+        lastTelemetry = millis();
+        String outgoingMessage = "{";
+        for (int i = 0; i < 4; i++) {
+            outgoingMessage += "\"odrv" + String(i + 1) + "-speed\":"
+                             + String(odrv_user_data[i].last_feedback.Vel_Estimate, 3);
+            if (i < 3) {
+                outgoingMessage += ",";
+            }
+        }
+        outgoingMessage += "}";
+
+        esp_err_t result = esp_now_send(masterAddress, (uint8_t*)outgoingMessage.c_str(), outgoingMessage.length() + 1);
+        if (result != ESP_OK) {
+            Serial.print("Send error: ");
+            Serial.println(esp_err_to_name(result));
+        }
+    }
 }
 
 // --- self-defined functions --- //
 
-// runs inside the receive callback: only parse and save values here.
-// no ODrive calls or Serial prints - those are slow and block WiFi.
+// runs inside the receive callback: only parse and save values here
+// dont do any ODrive calls or serial prints cos those are slow and block WiFi
 
 void processMaster(String receivedInput) {
     JsonDocument commands;
@@ -178,21 +293,18 @@ void processMaster(String receivedInput) {
 
 // --- motor control functions --- //
 
-/*
-void stopAll() {
-  bottomLeftMotor.setSpeed(0);
-  bottomRightMotor.setSpeed(0);
-  topLeftMotor.setSpeed(0);
-  topRightMotor.setSpeed(0);
-}
 
-void driveTrain_setSpeed(int topLeftSpeed, int topRightSpeed, int bottomLeftSpeed, int bottomRightSpeed) { //max 255 
-  bottomLeftMotor.setSpeed(bottomLeftSpeed*-1);
-  bottomRightMotor.setSpeed(bottomRightSpeed);
-  topLeftMotor.setSpeed(topLeftSpeed*-1);
-  topRightMotor.setSpeed(topRightSpeed);
+void driveTrain_setSpeed() {
+    float TLVel = transVel * sin(transAngle) - cmdRot;
+    float TRVel = transVel * cos(transAngle) + cmdRot;
+    float BLVel = transVel * cos(transAngle) - cmdRot;
+    float BRVel = transVel * sin(transAngle) + cmdRot;
+
+    TRodrv1.setVelocity(-TRVel);
+    TLodrv2.setVelocity(TLVel);
+    BLodrv3.setVelocity(BLVel);
+    BRodrv4.setVelocity(-BRVel);
 };
-*/
 
 // --- ESPNOW specific functions --- //
 
@@ -208,3 +320,134 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
         Serial.println("Delivery Fail");
     }
 }
+
+// --- Odrive CAN specific functions --- //
+
+bool setupCan() {
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        (gpio_num_t)ESP32_TWAI_TX_PIN,
+        (gpio_num_t)ESP32_TWAI_RX_PIN,
+        TWAI_MODE_NORMAL
+    );
+    g_config.rx_queue_len = 128; // default is 5, which overflows with 4 ODrives sending feedback + heartbeats
+
+    twai_timing_config_t t_config;
+    switch (CAN_BAUDRATE) {
+        case 1000000: t_config = TWAI_TIMING_CONFIG_1MBITS(); break;
+        case 800000:  t_config = TWAI_TIMING_CONFIG_800KBITS(); break;
+        case 500000:  t_config = TWAI_TIMING_CONFIG_500KBITS(); break;
+        case 250000:  t_config = TWAI_TIMING_CONFIG_250KBITS(); break;
+        case 125000:  t_config = TWAI_TIMING_CONFIG_125KBITS(); break;
+        case 100000:  t_config = TWAI_TIMING_CONFIG_100KBITS(); break;
+        case 50000:   t_config = TWAI_TIMING_CONFIG_50KBITS(); break;
+        case 25000:   t_config = TWAI_TIMING_CONFIG_25KBITS(); break;
+        default:      t_config = TWAI_TIMING_CONFIG_250KBITS(); break;
+    }
+
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+        return false;
+    }
+
+    if (twai_start() != ESP_OK) {
+        twai_driver_uninstall();
+        return false;
+    }
+
+    return true;
+}
+
+// Called every time a Heartbeat message arrives from the ODrive
+void onHeartbeat(Heartbeat_msg_t& msg, void* user_data) {
+  ODriveUserData* odrv_user_data = static_cast<ODriveUserData*>(user_data);
+  odrv_user_data->last_heartbeat = msg;
+  odrv_user_data->received_heartbeat = true;
+  odrv_user_data->last_heartbeat_ms = millis();
+}
+
+// Called every time a feedback message arrives from the ODrive
+void onFeedback(Get_Encoder_Estimates_msg_t& msg, void* user_data) {
+  ODriveUserData* odrv_user_data = static_cast<ODriveUserData*>(user_data);
+  odrv_user_data->last_feedback = msg;
+  odrv_user_data->received_feedback = true;
+}
+
+// Called for every message that arrives on the CAN bus
+void onCanMessage(const CanMsg& msg) {
+    if ((msg.id & 0x1F) == 0x01) { // heartbeat cmd id; node id is the upper bits
+        Serial.printf("heartbeat from node %lu\n", (unsigned long)(msg.id >> 5));
+    }
+    for (auto odrive: odrives) {
+        onReceive(msg, *odrive);
+    }
+}
+
+bool receiveHeartbeats() {
+
+        for (int i = 0; i < 4; i++) {
+        if (!odrv_user_data[i].received_heartbeat) {
+            return false;
+        }
+    }
+    return true;
+    /*
+    for testing CAN bus in isolation, its using TLodrv2
+
+    if (!odrv_user_data[1].received_heartbeat) {
+        Serial.print(String(1));
+        Serial.println("failed heartbeat");
+        return false;
+    }
+    return true;
+    */
+}
+
+bool putClosedLoops() {
+    bool allClosed = true;
+    for (int i = 0; i < 4; i++) {
+        if (odrv_user_data[i].last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
+            Serial.printf("node %d not in closed loop\n", i + 1);
+            allClosed = false;
+        }
+    }
+    return allClosed;
+}
+
+bool findLastCommands() {
+    if (millis() - lastCommandTime < COMMAND_PERIOD_MS) {
+        return false;
+    }
+    lastCommandTime = millis();
+    return true;
+}
+
+// Rearm any drive that left closed loop
+
+void rearmDrives() {
+    if (millis() - lastRearmTime < REARM_PERIOD_MS) {
+        return;
+    }
+    lastRearmTime = millis();
+
+    for (int i = 0; i < 4; i++) {
+        if (millis() - odrv_user_data[i].last_heartbeat_ms > 1000) {
+            return;                                   // CAN not healthy
+        }
+    }
+    if (transVel != 0 || cmdRot != 0) {
+        return;                                       // sticks not idle
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (odrv_user_data[i].last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
+            Serial.printf("node %d left closed loop", i + 1);
+            odrives[i]->clearErrors();
+            delay(1);
+            odrives[i]->setState(ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL);
+        }
+    }
+}
+
+
+

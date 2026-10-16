@@ -44,6 +44,7 @@ setting up motor wires
 6. in interfaces
     - turn on watchdog timer (default is 1s but when moving to drivetrain maybe drop it to 0.5s?)
     - turn on CAN
+        - Ensure that baud rate is set to 250000
     - for now, keep to default, but when implementing can frfr, here are some pointers,
     - node id identifies the different motors in the bus. you can assign the id dynamically by matching id to serial number (each motor has a unchanging serial number) thorugh can interface, or just statically assign through the gui. bothwork, read [this](https://docs.odriverobotics.com/v/latest/manual/can-protocol.html#discovery-addressing) for more info
     - definately turn on heartbeat, incase the wire dies for whatever reason we can atleast detect it
@@ -114,5 +115,3 @@ you have to build the virtual enviroment before launching scripts to make sure y
     .venv\Scripts\activate
     py -m pip install -r requirements.txt
     ```
-    (for developlers, remember to update the requirements.txt using ```py -m pip freeze > requirements.txt```)
-
