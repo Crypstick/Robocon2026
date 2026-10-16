@@ -13,10 +13,9 @@ from rerun.encodings import Angle, RotationAxisAngle
 stop_event = threading.Event()
 
 # --- Serial config ---
-SERIAL_PORT = "COM9"   # <-- change to your ESP32 port
+SERIAL_PORT = "COM9"  
 BAUD_RATE   = 115200
-POLL_RATE   = 0.02    # seconds between sends (20 Hz)
-
+POLL_RATE   = 0.02    # set to 50 hz rn, just f = 1/number
 
 # --- Rerun Config ---
 rr.init("Robocon2026")
@@ -64,7 +63,7 @@ def get_controller_payload(controller_index=0):
     triggers = get_trigger_values(state)
     thumbs   = get_thumb_values(state)
 
-    #  "buttons" is indexed in the same order as esp32_controller_ESPNOW.py's BUTTON_ORDER
+    #  "buttons" is indexed in the same order as BUTTON_ORDER
     #   0 DPAD_UP        8  LEFT_SHOULDER
     #   1 DPAD_DOWN      9  RIGHT_SHOULDER
     #   2 DPAD_LEFT      10 A
@@ -100,7 +99,6 @@ def get_controller_payload(controller_index=0):
     transAngle = round(directionalTrig(leftX, leftY, 45)[1], 3)
     cmdRot = round(rightY * MAX_ROT_SPEED, 3) # rotational velocity * speed
 
-    # Define transforms - each describes the relationship to its parent.
 
     rr.log("robot/cmd", rr.Transform3D(rotation=rr.RotationAxisAngle(axis=[1, 0, 0], angle=rr.Angle(rad=math.pi)),))
    # rr.log("robot/cmd/transVel", rr.Arrows3D(origins=[0,0,0], vectors=[leftX,leftY,0],radii=0.025))
@@ -132,16 +130,8 @@ def get_controller_payload(controller_index=0):
         "cmdRot": cmdRot,
         # buttons: button_states,
         # "triggers": [round(triggers[0], 3), round(triggers[1], 3)],
-        # "joysticks": [
-        #     [round(thumbs[0][0], 3), round(thumbs[0][1], 3)],
-        #     [round(thumbs[1][0], 3), round(thumbs[1][1], 3)],
-        # ],
     }
-    
-
-
-
-    # compact JSON + newline as message delimiter
+        # compact JSON + newline as message delimiter
     return json.dumps(payload, separators=(",", ":")) + "\n"
 
 
@@ -196,7 +186,7 @@ def serial_loop():
             ser = None
 
         while ser.in_waiting: 
-            robotMessage = ser.readline().decode('utf-8', errors='ignore').strip('\x00\r\n ')
+            robotMessage = ser.readline().decode('utf-8', errors='ignore').strip('\x00\r\n ') #the suffix came from null byte that was sent from C++ (tells system where string ends), and basically full length buffer was sent so it came w it
             try:
                 robotDict = json.loads(robotMessage)
             except:
@@ -223,5 +213,3 @@ def serial_loop():
 
 while True:
     serial_loop()
-
-# ── Tkinter main loop ──────────────────────────────────────────────────────────
