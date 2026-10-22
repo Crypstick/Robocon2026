@@ -23,7 +23,7 @@ rr.spawn()
 startTime = time.time()
 
 # --- Robot Variables ---
-MAX_TRANS_SPEED = 8
+MAX_TRANS_SPEED = 4
 MAX_ROT_SPEED = 2
 KP = 1
 KI = 1
@@ -84,8 +84,6 @@ def get_controller_payload(controller_index=0):
     buttonX        = buttons[12]
     buttonY        = buttons[13]
 '''
-    print(f"buttons were: {thumbs}")
-
     # joysticks = [[left_x, left_y], [right_x, right_y]]
     #deadzone implementation
     leftX = thumbs[0][0] if abs(thumbs[0][0]) > 0.08 else 0

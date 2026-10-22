@@ -2,6 +2,11 @@
 #include <esp_wifi.h>
 #include <WiFi.h>
 
+#include <AHRSProtocol.h>
+#include <IMUProtocol.h>
+#include <IMURegisters.h>
+#include <Wire.h>
+
 #include <ArduinoJson.h>
 #include <ArduinoJson.hpp>
 
@@ -9,6 +14,7 @@
 #include "ODriveESP32TWAI.hpp"
 
 #include <math.h>
+
 
 
 // this one is connected to ROBOT  //
@@ -20,7 +26,7 @@ void processController(String receivedInput);
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
 void OnDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len);
 
-void driveTrain_setSpeed();
+void driveTrain_setSpeed(int imuFail = 0);
 void stopAll();
 
 bool setupCan();
@@ -35,14 +41,18 @@ bool putClosedLoops();
 bool findLastCommands();
 void rearmDrives();
 
+
+
 // --- variable declarations --- //
 
 String incomingMessage;
 unsigned long lastMessageTime = 0; // millis() when the last controller message arrived
+unsigned long lastTelemetry = 0;
 
 float TRVel = 0; float TLVel = 0; float BRVel = 0; float BLVel = 0;
 int KP = 0; int KI = 0; int KD = 0;
-float transVel = 0; float transAngle = 0; float cmdRot = 0;
+float transVel = 0; float transAngle = 0; float cmdRot = 0; float driveAngle = 0;
+float yaw = 0; float pitch = 0; float roll = 0; float heading = 0; float zeroOffset = 0;
 
 float COMMAND_PERIOD_MS = 20;           // run the rest of loop() at most 50 Hz (the PC sends at 50 Hz)
 float REARM_PERIOD_MS   = 500;          // retry a faulted drive at most twice a second
@@ -57,9 +67,11 @@ uint8_t masterAddress[] = {0x78, 0x1C, 0x3C, 0xF5, 0x09, 0x20}; // the mac of th
 static const char* PMK_KEY_STR = "XABqkVajNdMXUG8t";
 static const char* LMK_KEY_STR = "JUO+D7GGRsJDhi1V";
 
+int register_address = NAVX_REG_YAW_L;
+
 // --- Odrive declarations --- //
 
-#define CAN_BAUDRATE  250000   // CAN bus baudrate. Make sure this matches for every device on the bus
+#define CAN_BAUDRATE  250000   // CAN bus baudrate. Max`ke sure this matches for every device on the bus
 
 #define TRodrv1_NODE_ID 1  // ODrive node_id for TRodrv1
 #define TLodrv2_NODE_ID 2
@@ -69,6 +81,11 @@ static const char* LMK_KEY_STR = "JUO+D7GGRsJDhi1V";
 // Pins used to connect to CAN bus transceiver. the CRX is to the RX pin, CTX to the TX pin
 #define ESP32_TWAI_TX_PIN 26
 #define ESP32_TWAI_RX_PIN 25
+
+#define NAVX_SENSOR_DEVICE_I2C_ADDRESS_7BIT  0x32
+#define NUM_BYTES_TO_READ                    8
+
+byte imuData[512];
 
 struct ODriveUserData {
   Heartbeat_msg_t last_heartbeat;
@@ -93,6 +110,13 @@ ODriveUserData odrv_user_data[4]; // index thru for 1 to 4
 void setup() {
     Serial.begin(115200);
     WiFi.mode(WIFI_STA);
+    Wire.begin(22,23); // join i2c bus (address optional for master)
+
+    for ( int i = 0; i < sizeof(imuData); i++ ) {
+    imuData[i] = 0;
+    }
+    
+
 
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
 
@@ -105,7 +129,6 @@ void setup() {
         Serial.println("Error initializing ESP-NOW");
         return;
     }
-    
 
     esp_now_set_pmk((uint8_t *)PMK_KEY_STR);
 
@@ -215,13 +238,20 @@ void setup() {
     }
 
     Serial.println("ODrives running!");
+
+    while (!processIMU());
+    zeroOffset = yaw; // for field oriented drive
+
+    
 }
 
 void loop() {
+
     pumpEvents(can_intf); // This is required on some platforms to handle incoming feedback CAN messages. This has been found to reduce the number of dropped messages, however it can be removed for applications requiring loop times over 100Hz.
     if (!findLastCommands()) {
-         return; 
-    }
+         return;
+    }  
+
         
     bool controllerLost = (millis() - lastMessageTime > 1000);
     bool canLost = false;                                      // CAN from any ODrive
@@ -236,7 +266,11 @@ void loop() {
         cmdRot = 0;
     }
 
-    driveTrain_setSpeed();
+    if (!processIMU()) {
+        driveTrain_setSpeed(1); // if IMU messes up we gonna just do robot oriented drive
+    } else {
+        driveTrain_setSpeed(0);
+    }
 
     if (canLost) {
         // the TWAI controller stays bus-off or stopped until restarted, so try to bring it back
@@ -251,9 +285,7 @@ void loop() {
 
     rearmDrives();
 
-    // telemetry: one combined message at 20 Hz, not one packet per CAN feedback frame
-    // (per-frame sending overflowed ESP-NOW's buffer: ESP_ERR_ESPNOW_NO_MEM)
-    unsigned long lastTelemetry = 0;
+    // one combined message at 20 Hz, not one packet per CAN feedback frame
     if (millis() - lastTelemetry >= 50) {
         lastTelemetry = millis();
         String outgoingMessage = "{";
@@ -276,9 +308,6 @@ void loop() {
 
 // --- self-defined functions --- //
 
-// runs inside the receive callback: only parse and save values here
-// dont do any ODrive calls or serial prints cos those are slow and block WiFi
-
 void processMaster(String receivedInput) {
     JsonDocument commands;
     deserializeJson(commands, receivedInput);
@@ -294,11 +323,19 @@ void processMaster(String receivedInput) {
 // --- motor control functions --- //
 
 
-void driveTrain_setSpeed() {
-    float TLVel = transVel * sin(transAngle) - cmdRot;
-    float TRVel = transVel * cos(transAngle) + cmdRot;
-    float BLVel = transVel * cos(transAngle) - cmdRot;
-    float BRVel = transVel * sin(transAngle) + cmdRot;
+void driveTrain_setSpeed(int imuFail) {
+
+    if (imuFail) {
+        driveAngle = transAngle;
+    } else {
+        driveAngle = transAngle - ((yaw - zeroOffset) * PI / 180); // confirm if i need to yaw + zeroOffset instead
+    }
+
+
+    float TLVel = transVel * sin(driveAngle) - cmdRot;
+    float TRVel = transVel * cos(driveAngle) + cmdRot;
+    float BLVel = transVel * cos(driveAngle) - cmdRot;
+    float BRVel = transVel * sin(driveAngle) + cmdRot;
 
     TRodrv1.setVelocity(-TRVel);
     TLodrv2.setVelocity(TLVel);
@@ -449,5 +486,49 @@ void rearmDrives() {
     }
 }
 
+/* --- IMU-based functions  --- */
+
+bool processIMU() {
+    // point the navX at the yaw register and tell it how many bytes we want
+    Wire.beginTransmission(NAVX_SENSOR_DEVICE_I2C_ADDRESS_7BIT);
+    Wire.write(register_address);
+    Wire.write(NUM_BYTES_TO_READ);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("no ACK from IMU");
+        return false;                                
+    }
+
+    int received = Wire.requestFrom(NAVX_SENSOR_DEVICE_I2C_ADDRESS_7BIT, NUM_BYTES_TO_READ);
+    delay(1);
+    if (received != NUM_BYTES_TO_READ) {
+        Serial.println("fewer bytes read");
+        return false;                                 
+    }
+
+    int imuBytes = 0;
+    while (Wire.available() && imuBytes < NUM_BYTES_TO_READ) {
+        imuData[imuBytes] = Wire.read();
+        imuBytes++;
+    }
+    if (imuBytes != NUM_BYTES_TO_READ) {
+        return false;
+    }
+
+    // Decode received imuData to floating-point orientation values
+    yaw     = IMURegisters::decodeProtocolSignedHundredthsFloat((char *)&imuData[0]);
+    pitch   = IMURegisters::decodeProtocolSignedHundredthsFloat((char *)&imuData[2]);
+    roll    = IMURegisters::decodeProtocolSignedHundredthsFloat((char *)&imuData[4]);
+    heading = IMURegisters::decodeProtocolUnsignedHundredthsFloat((char *)&imuData[6]);
+    Serial.print("yaw:  ");
+    Serial.print(yaw,2);
+    Serial.print("  pitch:  ");
+    Serial.print(pitch,2);
+    Serial.print("  roll:  ");
+    Serial.print(roll,2);
+    Serial.print("  heading:  ");
+    Serial.print(heading,2);  
+    Serial.println("");
+    return true;
+}
 
 
