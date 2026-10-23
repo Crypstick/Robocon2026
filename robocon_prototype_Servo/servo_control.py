@@ -4,14 +4,14 @@ import serial
 import pygame
 
 # ===== SETTINGS =====
-COM_PORT = "COM5"    # Change to your ESP32 port
+COM_PORT = "COM6"    # Change to your ESP32 port
 BAUD_RATE = 115200
 
 MIN_ANGLE = 0
-MAX_ANGLE = 360
+MAX_ANGLE = 180
 
 STEP = 5
-MOVE_INTERVAL = 0.1  # Seconds between movements
+MOVE_INTERVAL = 0.01  # Seconds between movements
 
 current_angle = 0
 
