@@ -24,7 +24,7 @@ esp_now_peer_info_t peerInfo;
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
 void OnDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len);
 
-StaticJsonDocument<200> slaveCommands;
+JsonDocument slaveCommands;
 
 
 void setup() {
@@ -82,7 +82,6 @@ void loop() {
             return;
         }
 
-        // serializeJson(slaveCommands, outgoingMessage);
         outgoingMessage = controllerInputs;
 
         esp_err_t result = esp_now_send(slaveAddress,(uint8_t*)outgoingMessage.c_str(),  outgoingMessage.length() + 1);
@@ -93,24 +92,6 @@ void loop() {
     }
 }
 
-// --- processing functions --- //
-void processPC(String receivedInput) {
-    JsonDocument doc;
-
-
-    deserializeJson(doc, receivedInput);
-
-    // joysticks = [[left_x, left_y], [right_x, right_y]]
-    slaveCommands["KP"] = doc["KP"];
-    slaveCommands["KI"]  = doc["KI"];
-    slaveCommands["KD"]  = doc["KD"];
-    slaveCommands["transVel"]  = doc["transVel"];
-    slaveCommands["transAngle"]  = doc["transAngle"];
-    slaveCommands["cmdRot"] = doc["cmdRot"];
-    // hand to loop()
-}
-
-
 // --- ESPNOW specific functions --- //
 
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
@@ -118,8 +99,6 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
         Serial.println("Delivery Fail");
     }
 }
-
-
 
 void OnDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
     incomingMessage = String((const char*)incomingData, len);

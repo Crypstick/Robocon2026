@@ -38,8 +38,7 @@ void onCanMessage(const CanMsg& msg);
 bool receiveHeartbeats();
 bool putClosedLoops();
 
-bool findLastCommands();
-void rearmDrives();
+void handleDriveErrors();
 
 
 
@@ -54,10 +53,15 @@ int KP = 0; int KI = 0; int KD = 0;
 float transVel = 0; float transAngle = 0; float cmdRot = 0; float driveAngle = 0;
 float yaw = 0; float pitch = 0; float roll = 0; float heading = 0; float zeroOffset = 0;
 
-float COMMAND_PERIOD_MS = 20;           // run the rest of loop() at most 50 Hz (the PC sends at 50 Hz)
-float REARM_PERIOD_MS   = 500;          // retry a faulted drive at most twice a second
-float lastCommandTime = 0;            
-float lastRearmTime   = 0;              
+bool zeroYawCmd = false;       
+bool lastZeroYawCmd = false;   
+
+int latchedError[4] = {0, 0, 0, 0};    
+bool clearErrorsCmd = false;           
+bool lastClearErrorsCmd = false;
+
+float COMMAND_PERIOD_MS = 20;          // loop() period
+float lastCommandTime = 0;
 
 esp_now_peer_info_t peerInfo;
 uint8_t masterAddress[] = {0x78, 0x1C, 0x3C, 0xF5, 0x09, 0x20}; // the mac of the one sending to
@@ -248,9 +252,10 @@ void setup() {
 void loop() {
 
     pumpEvents(can_intf); // This is required on some platforms to handle incoming feedback CAN messages. This has been found to reduce the number of dropped messages, however it can be removed for applications requiring loop times over 100Hz.
-    if (!findLastCommands()) {
+    if (millis() - lastCommandTime < COMMAND_PERIOD_MS) {
          return;
-    }  
+    }
+    lastCommandTime = millis();
 
         
     bool controllerLost = (millis() - lastMessageTime > 1000);
@@ -269,6 +274,11 @@ void loop() {
     if (!processIMU()) {
         driveTrain_setSpeed(1); // if IMU messes up we gonna just do robot oriented drive
     } else {
+        if (zeroYawCmd && !lastZeroYawCmd) {
+            zeroOffset = yaw;
+            Serial.println("yaw zeroed");
+        }
+        lastZeroYawCmd = zeroYawCmd;
         driveTrain_setSpeed(0);
     }
 
@@ -283,7 +293,7 @@ void loop() {
         }
     }
 
-    rearmDrives();
+    handleDriveErrors();
 
     // one combined message at 20 Hz, not one packet per CAN feedback frame
     if (millis() - lastTelemetry >= 50) {
@@ -296,7 +306,21 @@ void loop() {
                 outgoingMessage += ",";
             }
         }
-        outgoingMessage += "}";
+        outgoingMessage += ",\"err\":[";
+        for (int i = 0; i < 4; i++) {
+            outgoingMessage += String(latchedError[i]);
+            if (i < 3) {
+                outgoingMessage += ",";
+            }
+        }
+        outgoingMessage += "],\"state\":[";
+        for (int i = 0; i < 4; i++) {
+            outgoingMessage += String((int)odrv_user_data[i].last_heartbeat.Axis_State);
+            if (i < 3) {
+                outgoingMessage += ",";
+            }
+        }
+        outgoingMessage += "]}";
 
         esp_err_t result = esp_now_send(masterAddress, (uint8_t*)outgoingMessage.c_str(), outgoingMessage.length() + 1);
         if (result != ESP_OK) {
@@ -318,6 +342,9 @@ void processMaster(String receivedInput) {
     transVel  = commands["transVel"];
     transAngle  = commands["transAngle"];
     cmdRot = commands["cmdRot"];
+    zeroYawCmd = commands["zeroYaw"] | false;
+    clearErrorsCmd = commands["clearErrors"] | false;
+
 }
 
 // --- motor control functions --- //
@@ -371,13 +398,8 @@ bool setupCan() {
     twai_timing_config_t t_config;
     switch (CAN_BAUDRATE) {
         case 1000000: t_config = TWAI_TIMING_CONFIG_1MBITS(); break;
-        case 800000:  t_config = TWAI_TIMING_CONFIG_800KBITS(); break;
-        case 500000:  t_config = TWAI_TIMING_CONFIG_500KBITS(); break;
         case 250000:  t_config = TWAI_TIMING_CONFIG_250KBITS(); break;
-        case 125000:  t_config = TWAI_TIMING_CONFIG_125KBITS(); break;
         case 100000:  t_config = TWAI_TIMING_CONFIG_100KBITS(); break;
-        case 50000:   t_config = TWAI_TIMING_CONFIG_50KBITS(); break;
-        case 25000:   t_config = TWAI_TIMING_CONFIG_25KBITS(); break;
         default:      t_config = TWAI_TIMING_CONFIG_250KBITS(); break;
     }
 
@@ -451,39 +473,23 @@ bool putClosedLoops() {
     return allClosed;
 }
 
-bool findLastCommands() {
-    if (millis() - lastCommandTime < COMMAND_PERIOD_MS) {
-        return false;
-    }
-    lastCommandTime = millis();
-    return true;
-}
-
-// Rearm any drive that left closed loop
-
-void rearmDrives() {
-    if (millis() - lastRearmTime < REARM_PERIOD_MS) {
-        return;
-    }
-    lastRearmTime = millis();
-
-    for (int i = 0; i < 4; i++) {
-        if (millis() - odrv_user_data[i].last_heartbeat_ms > 1000) {
-            return;                                   // CAN not healthy
-        }
-    }
-    if (transVel != 0 || cmdRot != 0) {
-        return;                                       // sticks not idle
-    }
-
-    for (int i = 0; i < 4; i++) {
-        if (odrv_user_data[i].last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
-            Serial.printf("node %d left closed loop", i + 1);
+// latch every ODrive axis error until the PC sends clearErrors
+void handleDriveErrors() {
+    if (clearErrorsCmd && !lastClearErrorsCmd) {
+        for (int i = 0; i < 4; i++) {
             odrives[i]->clearErrors();
             delay(1);
             odrives[i]->setState(ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL);
+            odrv_user_data[i].last_heartbeat.Axis_Error = 0;   // stops the old heartbeat relatching it
+            latchedError[i] = 0;
+        }
+        Serial.println("errors cleared");
+    } else {
+        for (int i = 0; i < 4; i++) {
+            latchedError[i] |= odrv_user_data[i].last_heartbeat.Axis_Error;
         }
     }
+    lastClearErrorsCmd = clearErrorsCmd;
 }
 
 /* --- IMU-based functions  --- */

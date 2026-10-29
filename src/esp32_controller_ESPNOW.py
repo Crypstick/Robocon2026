@@ -29,6 +29,45 @@ KP = 1
 KI = 1
 KD = 1
 
+# in order of indexing
+BUTTON_ORDER = [
+    "DPAD_UP", "DPAD_DOWN", "DPAD_LEFT", "DPAD_RIGHT",
+    "START", "BACK", "LEFT_THUMB", "RIGHT_THUMB",
+    "LEFT_SHOULDER", "RIGHT_SHOULDER", "A", "B", "X", "Y",
+]
+
+
+ZERO_YAW_BUTTON = "BACK" #view button on the left
+CLEAR_ERRORS_BUTTON = "START" #menu button on the right
+
+ODRIVE_ERRORS = {
+    0x00000001: "INITIALIZING",
+    0x00000002: "SYSTEM_LEVEL",
+    0x00000004: "TIMING_ERROR",
+    0x00000008: "MISSING_ESTIMATE",
+    0x00000010: "BAD_CONFIG",
+    0x00000020: "DRV_FAULT",
+    0x00000040: "MISSING_INPUT",
+    0x00000100: "DC_BUS_OVER_VOLTAGE",
+    0x00000200: "DC_BUS_UNDER_VOLTAGE",
+    0x00000400: "DC_BUS_OVER_CURRENT",
+    0x00000800: "DC_BUS_OVER_REGEN_CURRENT",
+    0x00001000: "CURRENT_LIMIT_VIOLATION",
+    0x00002000: "MOTOR_OVER_TEMP",
+    0x00004000: "INVERTER_OVER_TEMP",
+    0x00008000: "VELOCITY_LIMIT_VIOLATION",
+    0x00010000: "POSITION_LIMIT_VIOLATION",
+    0x01000000: "WATCHDOG_TIMER_EXPIRED",
+    0x02000000: "ESTOP_REQUESTED",
+    0x04000000: "SPINOUT_DETECTED",
+    0x08000000: "BRAKE_RESISTOR_DISARMED",
+    0x10000000: "THERMISTOR_DISCONNECTED",
+    0x40000000: "CALIBRATION_ERROR",
+}
+
+MOTOR_NAMES = ["TRodrv1", "TLodrv2", "BLodrv3", "BRodrv4"]
+lastErrors = [0, 0, 0, 0]
+
 controllerConnected = False
 
 set_deadzone(DEADZONE_TRIGGER, 10)
@@ -36,21 +75,33 @@ set_deadzone(DEADZONE_TRIGGER, 10)
 
 def drawController():
     rr.log("robot/cmd/gate", rr.Ellipses2D(centers=[(0, 0), (20,-20)], half_sizes=[(MAX_TRANS_SPEED, MAX_TRANS_SPEED), (MAX_ROT_SPEED*3, MAX_ROT_SPEED*3)]), static=True)
-    rr.log()
 
 def rrRobotLogs(robotTelemetry):
     rr.log("robot/motors/TRodrv1-speed", rr.Scalars(robotTelemetry["odrv1-speed"]))
     rr.log("robot/motors/TLodrv2-speed", rr.Scalars(robotTelemetry["odrv2-speed"]))
-    rr.log("robot/motors/BLodrv1-speed", rr.Scalars(robotTelemetry["odrv3-speed"]))
-    rr.log("robot/motors/BRodrv1-speed", rr.Scalars(robotTelemetry["odrv4-speed"]))
+    rr.log("robot/motors/BLodrv3-speed", rr.Scalars(robotTelemetry["odrv3-speed"]))
+    rr.log("robot/motors/BRodrv4-speed", rr.Scalars(robotTelemetry["odrv4-speed"]))
 
+    errors = robotTelemetry.get("err", [0, 0, 0, 0])
+    states = robotTelemetry.get("state", [0, 0, 0, 0])
+    for i in range(4):
+        rr.log("robot/errors/" + MOTOR_NAMES[i], rr.Scalars(errors[i]))
+        rr.log("robot/states/" + MOTOR_NAMES[i], rr.Scalars(states[i]))
 
-# in order of indexing
-BUTTON_ORDER = [
-    "DPAD_UP", "DPAD_DOWN", "DPAD_LEFT", "DPAD_RIGHT",
-    "START", "BACK", "LEFT_THUMB", "RIGHT_THUMB",
-    "LEFT_SHOULDER", "RIGHT_SHOULDER", "A", "B", "X", "Y",
-]
+        # only when the code changes we print errors
+        if errors[i] != lastErrors[i]:
+            lastErrors[i] = errors[i]
+            if errors[i] == 0:
+                print(f"{MOTOR_NAMES[i]}: errors cleared")
+                rr.log("logs", rr.TextLog(f"{MOTOR_NAMES[i]}: errors cleared", level=rr.TextLogLevel.INFO))
+            else:
+                names = []
+                for flag in ODRIVE_ERRORS: #looks thru each error flag
+                    if errors[i] & flag: #compare if bit is set in reported error to the same bit in flag 
+                        names.append(ODRIVE_ERRORS[flag])
+                message = f"{MOTOR_NAMES[i]}: {hex(errors[i])} " + ", ".join(names)
+                print(message)
+                rr.log("logs", rr.TextLog(message, level=rr.TextLogLevel.ERROR))
 
 
 def get_controller_payload(controller_index=0):
@@ -119,6 +170,10 @@ def get_controller_payload(controller_index=0):
         else:
             button_states.append(0)
 
+    if buttons[ZERO_YAW_BUTTON]:
+        set_vibration(0, 3000, 3000)
+
+    
     payload = {
         "KP": KP,
         "KI": KI,
@@ -126,7 +181,9 @@ def get_controller_payload(controller_index=0):
         "transVel": transVel,
         "transAngle": transAngle,
         "cmdRot": cmdRot,
-        # buttons: button_states,
+        "buttons": button_states,
+        "zeroYaw": buttons[ZERO_YAW_BUTTON],
+        "clearErrors": buttons[CLEAR_ERRORS_BUTTON],
         # "triggers": [round(triggers[0], 3), round(triggers[1], 3)],
     }
         # compact JSON + newline as message delimiter
@@ -195,12 +252,9 @@ def serial_loop():
                     print(robotDict["odrv1-speed"])
                     rrRobotLogs(robotDict)
                     #print(f"the robot said: {robotMessage}")
-                    
             except:
                 print("OH MY GOSH DEBUG: ")
                 print(robotMessage)
-
-
 
         time.sleep(POLL_RATE)
 
